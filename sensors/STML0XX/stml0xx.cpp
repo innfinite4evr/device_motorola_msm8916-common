@@ -13,7 +13,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <cutils/log.h>
-#include "linux/stml0xx.h"
+#include <linux/stml0xx.h>
 
 /******************************* # defines **************************************/
 #define STM_DRIVER "/dev/stml0xx"
@@ -25,6 +25,8 @@
 #define STM_VERSION_MISMATCH -1
 #define STM_VERSION_MATCH 1
 #define STM_DOWNLOADRETRIES 3
+#define STM_MAX_BOOT_CHECK_RETRIES 10
+#define STM_MAX_BOOT_CHECK_DELAY_US 500000
 #define STM_MAX_PACKET_LENGTH 256
 /* 512 matches the read buffer in kernel */
 #define STM_MAX_GENERIC_DATA 512
@@ -63,6 +65,7 @@ typedef enum tag_stmmode
 {
     BOOTLOADER,
     BOOTFACTORY,
+    ERASE,
     NORMAL,
     DEBUG,
     FACTORY,
@@ -118,7 +121,8 @@ int stm_version_check(int fd, bool check)
         ret = STM_VERSION_MATCH;
     }
 
-    LOGINFO("Version info: version in filesystem = %d, version in hardware = %d\n",newversion, oldversion)
+    LOGINFO("Version info: version in filesystem = %d [0x%02X], version in hardware = %d [0x%02X]\n",
+                newversion, newversion, oldversion, oldversion)
 
     fclose(vfp);
     return ret;
@@ -208,7 +212,7 @@ EXIT:
 
 int main(int argc, char *argv[])
 {
-    int fd = -1, tries, ret = STM_SUCCESS;
+    int fd = -1, download_retries, boot_check_retries, ret = STM_SUCCESS;
     FILE * filep = NULL;
     eStm_Mode emode = INVALID;
     int temp = 100; // this is only a dummy variable for the 3rd parameter of ioctl call
@@ -217,6 +221,7 @@ int main(int argc, char *argv[])
     short delay = 0;
     int enabledints = 0;
     bool versioncheck = true;
+    bool sensorhubBooted = false;
     char ver_string[FW_VERSION_SIZE];
     char fw_file_name[256];
 
@@ -227,6 +232,8 @@ int main(int argc, char *argv[])
         emode = BOOTLOADER;
     else if( !strcmp(argv[1], "bootfactory"))
         emode = BOOTFACTORY;
+    else if(!strcmp(argv[1], "erase"))
+        emode = ERASE;
     else if( !strcmp(argv[1], "normal"))
         emode = NORMAL;
     else if(!strcmp(argv[1], "tboot"))
@@ -282,36 +289,62 @@ int main(int argc, char *argv[])
 
         /* check if new firmware available for download */
         if( (filep != NULL) && (stm_version_check(fd, versioncheck) == STM_VERSION_MISMATCH)) {
-            tries = 0;
-            while((tries < STM_DOWNLOADRETRIES )) {
+            download_retries = 0;
+            while((download_retries < STM_DOWNLOADRETRIES )) {
                 if( (stm_downloadFirmware(fd, filep)) >= STM_SUCCESS) {
-                    fclose(filep);
-                    filep = NULL;
-                    /* reset STM */
                     if (emode == BOOTLOADER) {
+                        /* reset STM */
+                        usleep(STM_MAX_BOOT_CHECK_DELAY_US);
                         ret = ioctl(fd, STML0XX_IOCTL_NORMALMODE, &temp);
                         printf("\n");
-                        if (stm_version_check(fd, true) == STM_VERSION_MATCH)
-                            LOGINFO("Firmware download completed successfully\n")
-                        else
-                            LOGERROR("Firmware download error\n")
+
+                        /* Wait until the hub is fully booted */
+                        boot_check_retries = 0;
+                        sensorhubBooted = 0;
+                        while (boot_check_retries < STM_MAX_BOOT_CHECK_RETRIES &&
+                                !sensorhubBooted) {
+                            usleep(STM_MAX_BOOT_CHECK_DELAY_US);
+
+                            ret = ioctl(fd, STML0XX_IOCTL_GET_BOOTED, &sensorhubBooted);
+                            boot_check_retries++;
+                        }
                     }
                     else
                         emode = FACTORY;
-                    break;
+
+                    // If sensorhub did not successfully boot
+                    // do not break and try to flash it again
+                    if (sensorhubBooted) {
+                        LOGINFO("STML0XX Booted, Firmware download completed successfully\n")
+                        break;
+                    } else {
+                        LOGERROR("STML0XX did not boot\n");
+                    }
                 }
-                //point the file pointer to the beginning of the file for the next try
-                tries++;
-                fseek(filep, 0, SEEK_SET);
-                // Need to use sleep as msleep is not available
-                sleep(1);
+
+                download_retries++;
+                if (download_retries < STM_DOWNLOADRETRIES) {
+                    //point the file pointer to the beginning of the file for the next try
+                    fseek(filep, 0, SEEK_SET);
+                    LOGERROR("STML0XX retry flashing: %d / %d\n", download_retries + 1,
+                            STM_DOWNLOADRETRIES);
+
+                    // Need to use sleep as msleep is not available
+                    sleep(1);
+                }
             }
 
-            if( tries >= STM_DOWNLOADRETRIES ) {
+            if( sensorhubBooted ) {
+                if (stm_version_check(fd, true) != STM_VERSION_MATCH)
+                    LOGERROR("STML0XX version mismatch\n")
+            } else {
                 LOGERROR("Firmware download failed.\n")
                 ret = STM_FAILURE;
                 ioctl(fd,STML0XX_IOCTL_NORMALMODE, &temp);
             }
+
+            fclose(filep);
+            filep = NULL;
         } else {
             DEBUG("No new firmware to download \n");
             /* reset STM in case for soft-reboot of device */
@@ -320,6 +353,15 @@ int main(int argc, char *argv[])
             else
                 emode = FACTORY;
         }
+    }
+    if(emode == ERASE) {
+        DEBUG("Ioctl call to switch to bootloader mode\n");
+        ret = ioctl(fd, STML0XX_IOCTL_BOOTLOADERMODE, &temp);
+        CHECK_RETURN_VALUE(ret,"Failed to switch STM to bootloader mode\n");
+
+        DEBUG("Ioctl call to erase flash on STM\n");
+        ret = ioctl(fd, STML0XX_IOCTL_MASSERASE, &temp);
+        CHECK_RETURN_VALUE(ret,"Failed to erase STM \n");
     }
     if(emode == NORMAL) {
         DEBUG("Ioctl call to reset STM\n");
@@ -399,6 +441,7 @@ int main(int argc, char *argv[])
             system("echo 'file stml0xx_wake_irq.c -p' > /sys/kernel/debug/dynamic_debug/control");
             system("echo 'file stml0xx_display.c -p' > /sys/kernel/debug/dynamic_debug/control");
             system("echo 'file stml0xx_spi.c -p' > /sys/kernel/debug/dynamic_debug/control");
+            system("echo 'file stml0xx_led.c -p' > /sys/kernel/debug/dynamic_debug/control");
         }
         else {
             system("echo 'file stml0xx_core.c +p' > /sys/kernel/debug/dynamic_debug/control");
@@ -410,6 +453,7 @@ int main(int argc, char *argv[])
             system("echo 'file stml0xx_wake_irq.c +p' > /sys/kernel/debug/dynamic_debug/control");
             system("echo 'file stml0xx_display.c +p' > /sys/kernel/debug/dynamic_debug/control");
             system("echo 'file stml0xx_spi.c +p' > /sys/kernel/debug/dynamic_debug/control");
+            system("echo 'file stml0xx_led.c +p' > /sys/kernel/debug/dynamic_debug/control");
         }
     }
     if( emode == FACTORY ) {
@@ -499,13 +543,17 @@ int main(int argc, char *argv[])
         if (read_write) {
             ret = ioctl(fd,STML0XX_IOCTL_WRITE_REG,data_ptr);
             DEBUG ("Writing data returned: %d", ret);
+            printf ("Writing data returned: %d", ret);
         } else {
             ret = ioctl(fd,STML0XX_IOCTL_READ_REG,data_ptr);
             DEBUG ("Read data:");
+            printf ("Read data:");
             for ( i = 0; i < data_size; i++) {
                 DEBUG (" %02x", data_ptr[i]);
+                printf (" %02x", data_ptr[i]);
             }
         }
+        printf("\n");
 
         free(data_ptr);
     }
