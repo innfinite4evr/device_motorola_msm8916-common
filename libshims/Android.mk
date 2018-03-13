@@ -15,15 +15,19 @@
 
 LOCAL_PATH := $(call my-dir)
 
+# Camera
 include $(CLEAR_VARS)
-
 LOCAL_SRC_FILES := MediaCodec.cpp
-
 LOCAL_SHARED_LIBRARIES := libstagefright libmedia
-
 LOCAL_MODULE := libshims_camera
 LOCAL_MODULE_TAGS := optional
+include $(BUILD_SHARED_LIBRARY)
 
+# GPS
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES := get_process_name.c
+LOCAL_MODULE := libshims_get_process_name
+LOCAL_MODULE_TAGS := optional
 include $(BUILD_SHARED_LIBRARY)
 
 # RIL
@@ -34,11 +38,13 @@ LOCAL_MODULE := libshim_ril
 LOCAL_MODULE_TAGS := optional
 include $(BUILD_SHARED_LIBRARY)
 
-# GPS
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES := get_process_name.c
-LOCAL_MODULE := libshims_get_process_name
+LOCAL_SRC_FILES := libqsap_shim.c
+LOCAL_SHARED_LIBRARIES := libqsap_sdk liblog
+LOCAL_C_INCLUDES := $(TOP)/system/qcom/softap/sdk
+LOCAL_MODULE := libqsap_shim
 LOCAL_MODULE_TAGS := optional
+LOCAL_PROPRIETARY_MODULE := true
 include $(BUILD_SHARED_LIBRARY)
 
 include $(CLEAR_VARS)
